@@ -1,4 +1,5 @@
 import numpy as np
+from ldpc import bposd_decoder, bp_decoder
 
 class GeneralFlippingDecoder():
     def base_cost(self, marked_checks: np.ndarray[bool]):
@@ -73,88 +74,6 @@ class FlippingDecoder():
         # # else
         # return ((num_checks+2)//6)*2 + 1
 
-    def cost_optimized_further(self, marked_checks: np.ndarray[bool], max_cost, max_function_calls=np.inf):
-        """
-        Returns cost estimate, the faults to flip and the number of function calls
-        """
-        function_calls = 1
-
-        graph = self.fault_graph
-        cost_gauge = self.base_cost(marked_checks)
-
-        if cost_gauge == 0 or cost_gauge > max_cost:
-            return cost_gauge, [], function_calls
-        
-        #fault_pattern = graph[marked_checks].sum(axis=0)
-        #con3_faults = np.nonzero(fault_pattern == 3)[0]
-        #con2_faults = np.nonzero(fault_pattern == 2)[0]
-        #con1_faults = np.nonzero(fault_pattern == 1)[0]
-        ##con32_faults = np.nonzero(fault_pattern >= 2)[0]
-        ##con_any_faults = np.nonzero(fault_pattern)[0]
-        #con32_faults = np.hstack([con3_faults, con2_faults]) # smarter order
-        #con_any_faults = np.hstack([con32_faults, con1_faults]) # smarter order
-
-        #del fault_pattern
-
-        #S = marked_checks.sum()
-
-        if cost_gauge == 1:
-            faults_to_check = np.nonzero(graph[marked_checks].sum(axis=0) >= 3)[0] # WHAAAT
-            #if len(con3_faults) == 1:
-            if len(faults_to_check):
-                return cost_gauge, [faults_to_check[0]], function_calls
-                #return cost_gauge, [con3_faults[0]], function_calls
-            cost_gauge = 3
-
-        # if cost_gauge > max_cost:
-        #     return cost_gauge, []
-        
-        # if depth == 0: # after this we for sure have to go a recursion deeper, so check if we are allowed
-        #     # ACTUALLY NOT NECESSARILY TRUE BUT WHATEVER
-        #     return cost_gauge, [], function_calls
-        
-        while cost_gauge <= max_cost:
-            if marked_checks.sum() <= cost_gauge:
-                if cost_gauge == 4: # small optimization, only look around 1 particular check
-                    faults_to_check = np.nonzero(graph[marked_checks][0])[0]
-                    
-                else:
-                    #faults_to_check = con_any_faults
-                    faults_to_check = np.nonzero(graph[marked_checks].any(axis=0))[0] # WHAAAT
-                    #faults_to_check = np.hstack([np.nonzero(graph[marked_checks].sum(axis=0) == 3)[0], np.nonzero(graph[marked_checks].sum(axis=0) == 2)[0], np.nonzero(graph[marked_checks].sum(axis=0) == 1)[0]]) # WHAAAT
-
-
-            elif marked_checks.sum() <= 2*cost_gauge:
-                #faults_to_check = con32_faults
-                faults_to_check = np.hstack([np.nonzero(graph[marked_checks].sum(axis=0) == 3)[0], np.nonzero(graph[marked_checks].sum(axis=0) == 2)[0]]) # WHAAAT
-                #faults_to_check = np.nonzero(graph[marked_checks].sum(axis=0) >= 2)[0]
-                # TODO: feasability filter
-            else: #marked_checks.sum() <= 3*cost_gauge
-                #faults_to_check = con3_faults
-                faults_to_check = np.nonzero(graph[marked_checks].sum(axis=0) >= 3)[0]
-                if len(faults_to_check) < marked_checks.sum() - 2*cost_gauge: # feasability filter
-                    faults_to_check = []
-
-            # now that we now what faults to check, we iterate through them
-            for fault in faults_to_check:
-                marked_checks_prime = marked_checks ^ (graph[:, fault] == 1)
-
-                # need to check here
-                if max_function_calls - function_calls <= 0:
-                    return cost_gauge, [], function_calls
-                
-                cost, path, new_function_calls = self.cost_optimized_further(marked_checks_prime, max_cost = cost_gauge-1, max_function_calls=max_function_calls - function_calls)
-                function_calls += new_function_calls
-
-                if cost == cost_gauge-1:
-                    return cost_gauge, [fault] + path, function_calls
-            
-            # if at this point we haven't returned that means the actual cost is higher
-            # so we increase our estimate of the cost (by 2, as parity is fixed)
-            cost_gauge += 2
-            
-        return cost_gauge, [], function_calls
-
     def is_base_case(self, marked_checks: np.ndarray[bool]):
         graph = self.fault_graph
         if marked_checks.sum() == 3:
@@ -163,6 +82,116 @@ class FlippingDecoder():
                 return True, faults_to_check[0]
         return False, None
         
+    def weight_iterative_with_bp(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf):
+        """
+        Iterative minimum weight calculations.
+        Returns weight_estimate (weight lower bound), minimum_weight_error, number_of_calls
+        Raises MaxIterationsExceededException if a solution could not be found within max_iterations steps
+        """
+
+        graph = self.fault_graph
+        syndrome = syndrome.astype(bool)
+
+        is_base_case, sol = self.is_base_case(syndrome)
+        if is_base_case:
+            return 1, [sol]
+
+        weight_estimate = self.base_cost(syndrome)
+
+        if weight_estimate == 0 or weight_estimate > max_weight:
+            return weight_estimate, []
+        
+        if weight_estimate == 1 and not is_base_case:
+            weight_estimate = 3
+
+        num_iterations = 0
+
+        while weight_estimate <= max_weight:
+            num_iterations += 1
+            if num_iterations >= max_iterations:
+                raise ValueError(f"MaxIterations {max_iterations} exceeded (Will be a custom exception)")
+
+            # assume weight = weight_estimate, dynamic programming using that assumption
+            nodes = [()]
+            parent_lookup = {0: None}
+            children_lookup = {0: []}
+
+            current_node = 0
+
+            while True:
+                if weight_estimate <= 1:
+                    faults_to_check_mask = np.array([0])
+                elif syndrome.sum() <= weight_estimate:
+                    if weight_estimate == 4: # small optimization, only look around 1 particular check
+                        faults_to_check_mask = graph[syndrome][0] == 1
+                        #faults_to_check_mask = faults_to_check[len(children_lookup[current_node]):]
+                    else:
+                        faults_to_check_mask = graph[syndrome].any(axis=0)
+                        #faults_to_check = np.hstack([np.nonzero(graph[syndrome].sum(axis=0) == 3)[0], np.nonzero(graph[syndrome].sum(axis=0) == 2)[0], np.nonzero((graph[syndrome].sum(axis=0) == 1) & graph[np.nonzero(syndrome)[0][0]])[0]])
+                        #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                elif syndrome.sum() <= 2*weight_estimate:
+                    faults_to_check_mask = graph[syndrome].sum(axis=0) >= 2
+
+                    #faults_to_check = np.hstack([np.nonzero(graph[syndrome].sum(axis=0) == 3)[0], np.nonzero(graph[syndrome].sum(axis=0) == 2)[0]])
+                    #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                    # TODO: feasability filter
+                else: #marked_checks.sum() <= 3*weight_estimate
+                    faults_to_check_mask = graph[syndrome].sum(axis=0) >= 3
+                    #faults_to_check = np.nonzero(graph[syndrome].sum(axis=0) >= 3)[0]
+                    #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+
+                num_remaining_candidates = faults_to_check_mask.sum() - len(children_lookup[current_node]) #total - the ones checked already
+                if num_remaining_candidates < syndrome.sum() - 2*weight_estimate: # feasability filter
+                    faults_to_check_mask = np.array([0])
+
+                if faults_to_check_mask.sum() > 0:
+                    #use bpd to find likelihoods of faults being in Fhat
+                    self.bpd.decode(syndrome)
+                    # calculate actual candidate fault indices and sort them according to their likelihood
+                    faults_to_check = np.where(faults_to_check_mask)[0][np.argsort(self.bpd.log_prob_ratios[faults_to_check_mask])]
+                    # the fault we check is the next one we haven't checked
+                    fault = faults_to_check[len(children_lookup[current_node])]
+                    new_node_idx = len(nodes)
+                    new_fault_set = nodes[current_node] + (fault,)
+                    children_lookup[current_node].append(new_node_idx)
+                    parent_lookup[new_node_idx] = current_node
+                    nodes.append(new_fault_set)
+                    children_lookup[new_node_idx] = []
+                    current_node = new_node_idx
+                    syndrome = syndrome ^ (graph[:, fault] == 1)
+                    is_base_case, sol = self.is_base_case(syndrome)
+                    weight_estimate -= 1
+
+                    if is_base_case:
+                        new_node_idx = len(nodes)
+                        new_fault_set = nodes[current_node] + (sol,)
+                        nodes.append(new_fault_set)
+                        parent_lookup[new_node_idx] = current_node
+                        children_lookup[new_node_idx] = []
+                        return new_fault_set, new_node_idx, nodes, parent_lookup, children_lookup
+                    
+                    if self.base_cost(syndrome) > weight_estimate:
+                        #raise ValueError("this conidtion is met")
+                        parent_idx = parent_lookup[current_node]
+                        if parent_idx is None:
+                            break
+                        fault = nodes[current_node][-1]
+                        syndrome = syndrome ^ (graph[:, fault] == 1)
+                        current_node = parent_idx
+                        weight_estimate += 1
+                    
+                    
+                else:
+                    parent_idx = parent_lookup[current_node]
+                    if parent_idx is None:
+                        break
+                    fault = nodes[current_node][-1]
+                    syndrome = syndrome ^ (graph[:, fault] == 1)
+                    current_node = parent_idx
+                    weight_estimate += 1
+
+            weight_estimate += 2
+
     def weight_iterative(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf):
         """
         Iterative minimum weight calculations.
@@ -230,6 +259,7 @@ class FlippingDecoder():
                     syndrome = syndrome ^ (graph[:, fault] == 1)
                     is_base_case, sol = self.is_base_case(syndrome)
                     weight_estimate -= 1
+
                     if is_base_case:
                         new_node_idx = len(nodes)
                         new_fault_set = nodes[current_node] + (sol,)
@@ -237,6 +267,17 @@ class FlippingDecoder():
                         parent_lookup[new_node_idx] = current_node
                         children_lookup[new_node_idx] = []
                         return new_fault_set, new_node_idx, nodes, parent_lookup, children_lookup
+                    
+                    if self.base_cost(syndrome) > weight_estimate:
+                        #raise ValueError("this conidtion is met")
+                        parent_idx = parent_lookup[current_node]
+                        if parent_idx is None:
+                            break
+                        fault = nodes[current_node][-1]
+                        syndrome = syndrome ^ (graph[:, fault] == 1)
+                        current_node = parent_idx
+                        weight_estimate += 1
+                    
                     
                 else:
                     parent_idx = parent_lookup[current_node]
@@ -526,8 +567,18 @@ class FlippingDecoder():
                 full_error[idx] = not full_error[idx]
             return full_error, function_calls
 
-    def __init__(self, fault_graph: np.ndarray) -> None:
+    def __init__(self, fault_graph: np.ndarray, max_iter=1024) -> None:
         self.fault_graph = fault_graph
+
+        bpd=bp_decoder(
+            self.fault_graph,#the parity check matrix
+            error_rate=0.01,# dummy error rate
+            channel_probs=[None], #assign error_rate to each qubit. This will override "error_rate" input variable
+            max_iter=max_iter, #the maximum number of iterations for BP)
+            bp_method="ms",
+            ms_scaling_factor=0, #min sum scaling factor. If set to zero the variable scaling factor method is used
+            )
+        self.bpd = bpd
 
         self.check_to_fault =[[],[]]
         self.fault_to_check = [[],[]]
