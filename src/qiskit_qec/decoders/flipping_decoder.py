@@ -144,7 +144,7 @@ class FlippingDecoder():
                 if num_remaining_candidates < syndrome.sum() - 2*weight_estimate: # feasability filter
                     faults_to_check_mask = np.array([0])
 
-                if faults_to_check_mask.sum() > 0:
+                if faults_to_check_mask.sum() > 0: # not good...
                     #use bpd to find likelihoods of faults being in Fhat
                     self.bpd.decode(syndrome)
                     # calculate actual candidate fault indices and sort them according to their likelihood
@@ -192,7 +192,7 @@ class FlippingDecoder():
 
             weight_estimate += 2
 
-    def weight_iterative(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf):
+    def weight_iterative(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf, memoize=True):
         """
         Iterative minimum weight calculations.
         Returns weight_estimate (weight lower bound), minimum_weight_error, number_of_calls
@@ -233,26 +233,41 @@ class FlippingDecoder():
                 elif syndrome.sum() <= weight_estimate:
                     if weight_estimate == 4: # small optimization, only look around 1 particular check
                         faults_to_check = np.nonzero(graph[syndrome][0])[0]
-                        faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                        #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
                     else:
                         faults_to_check = np.hstack([np.nonzero(graph[syndrome].sum(axis=0) == 3)[0], np.nonzero(graph[syndrome].sum(axis=0) == 2)[0], np.nonzero((graph[syndrome].sum(axis=0) == 1) & graph[np.nonzero(syndrome)[0][0]])[0]])
-                        faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                        #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
                 elif syndrome.sum() <= 2*weight_estimate:
                     faults_to_check = np.hstack([np.nonzero(graph[syndrome].sum(axis=0) == 3)[0], np.nonzero(graph[syndrome].sum(axis=0) == 2)[0]])
-                    faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                    #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
                     # TODO: feasability filter
                 else: #marked_checks.sum() <= 3*weight_estimate
                     faults_to_check = np.nonzero(graph[syndrome].sum(axis=0) >= 3)[0]
-                    faults_to_check = faults_to_check[len(children_lookup[current_node]):]
-                    if len(faults_to_check) < syndrome.sum() - 2*weight_estimate: # feasability filter
-                        faults_to_check = np.array([],dtype=int)
+                    #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
+                    #if len(faults_to_check) < syndrome.sum() - 2*weight_estimate: # feasability filter
+                    #    faults_to_check = np.array([],dtype=int)
+
+                # remove duplicates
+                faults_to_check = [f for f in faults_to_check if f not in nodes[current_node]]
+
+                num_remaining_candidates = len(faults_to_check) - len(children_lookup[current_node]) #total - the ones checked already
+                if num_remaining_candidates < max(1, syndrome.sum() - 2*weight_estimate): # feasability filter
+                    faults_to_check = []
+
 
                 if len(faults_to_check) > 0:
-                    fault = faults_to_check[0]
+                    fault = faults_to_check[len(children_lookup[current_node])]
                     new_node_idx = len(nodes)
                     new_fault_set = nodes[current_node] + (fault,)
-                    children_lookup[current_node].append(new_node_idx)
-                    parent_lookup[new_node_idx] = current_node
+                    if memoize:
+                        new_fault_set = tuple(np.sort(new_fault_set))
+                        children_lookup[current_node].append(new_node_idx) # add to children lookup in any case, because otherwise endless loop..
+                        if new_fault_set in nodes:
+                            continue
+                    else:
+                        children_lookup[current_node].append(new_node_idx)
+
+                    parent_lookup[new_node_idx] = current_node # only if new node, as can only have one parent now. might change that
                     nodes.append(new_fault_set)
                     children_lookup[new_node_idx] = []
                     current_node = new_node_idx
@@ -273,7 +288,12 @@ class FlippingDecoder():
                         parent_idx = parent_lookup[current_node]
                         if parent_idx is None:
                             break
-                        fault = nodes[current_node][-1]
+                        #fault = nodes[current_node][-1]
+                        if memoize:
+                            # then fault is set difference
+                            fault = [f for f in nodes[current_node] if f not in nodes[parent_idx]][0]
+                        else:
+                            fault = nodes[current_node][-1]
                         syndrome = syndrome ^ (graph[:, fault] == 1)
                         current_node = parent_idx
                         weight_estimate += 1
@@ -283,12 +303,18 @@ class FlippingDecoder():
                     parent_idx = parent_lookup[current_node]
                     if parent_idx is None:
                         break
-                    fault = nodes[current_node][-1]
+                    if memoize:
+                        # then fault is set difference
+                        fault = [f for f in nodes[current_node] if f not in nodes[parent_idx]][0]
+                    else:
+                        fault = nodes[current_node][-1]
                     syndrome = syndrome ^ (graph[:, fault] == 1)
                     current_node = parent_idx
                     weight_estimate += 1
 
             weight_estimate += 2
+        
+        return 'fails'
 
     def cost_iterative_total(self, marked_checks: np.ndarray[bool], max_cost):
         graph = self.fault_graph
