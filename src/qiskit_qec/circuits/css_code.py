@@ -267,6 +267,30 @@ class CSSCodeCircuit(CodeCircuit):
             **kwargs,
         )
         return nodes
+    
+    # def string2syndrome(self, string: str):
+    #     import numpy as np
+    #     parts = string[::-1].split(' ')
+    #     parts = [np.array(list(part)).astype(int) for part in parts]
+    #     first = np.vstack(parts[:-1:2])
+    #     second = np.vstack(parts[1:-1:2])
+    #     sparse_first = np.diff(first, axis=0, prepend=np.zeros_like(first[0]).reshape(1,-1))
+    #     sparse_second = np.diff(second, axis=0)
+    #     first_detectors = [[] for _ in range(sparse_first.shape[0])]
+    #     for time, det in zip(*np.where(sparse_first)):
+    #         first_detectors[time].append(det)
+    #     second_detectors = [[] for _ in range(sparse_second.shape[0])]
+    #     for time, det in zip(*np.where(sparse_second)):
+    #         second_detectors[time].append(det)
+    #     final_meas = parts[-1]
+
+    #     _, all_logicals = self.stim_detectors(full_logicals=True)
+
+    #     log_outs = string2logical_meas(string, all_logicals, self.circuit["0"].clbits)
+    #     result = {'logical': log_outs,
+    #               f'detectors_{self.round_schedule[0]}': first_detectors,
+    #               f'detectors_{self.round_schedule[1]}': second_detectors,}
+    #     return result
 
     def string2raw_logicals(self, string):
         """
@@ -357,12 +381,13 @@ class CSSCodeCircuit(CodeCircuit):
                 det["time"] = self.T
                 det["basis"] = "x"
                 detectors.append(det)
-            logicals.append(
-                {
-                    "clbits": [(reg_T, q) for q in sorted(self.logical_x[0])],
-                    "basis": "x",
-                }
-            )
+            for logical_x in self.logical_x:
+                logicals.append(
+                        {
+                            "clbits": [(reg_T, q) for q in sorted(logical_x)],
+                            "basis": "x",
+                        }
+                )
         else:
             reg_prev = "round_" + str(self.T - 1) + "_z_bits"
             reg_T = "final_readout"
@@ -376,12 +401,13 @@ class CSSCodeCircuit(CodeCircuit):
                 det["time"] = self.T
                 det["basis"] = "z"
                 detectors.append(det)
-            logicals.append(
-                {
-                    "clbits": [(reg_T, q) for q in sorted(self.logical_z[0])],
-                    "basis": "z",
-                }
-            )
+            for logical_z in self.logical_z:
+                logicals.append(
+                        {
+                            "clbits": [(reg_T, q) for q in sorted(logical_z)],
+                            "basis": "z",
+                        }
+                )
 
         return detectors, logicals
 

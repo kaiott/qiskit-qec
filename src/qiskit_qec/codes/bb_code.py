@@ -13,12 +13,18 @@
 
 from typing import List, Optional, Sequence, Tuple
 
+import ipywidgets as widgets
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import pandas as pd
 import rustworkx as rx
+from IPython.display import display
+from matplotlib.patches import Circle
 from rustworkx.visualization import graphviz_draw
 from scipy import sparse
 
+from qiskit_qec.linear.matrix import rank
 from qiskit_qec.linear.symplectic import normalizer
 from qiskit_qec.operators.pauli_list import PauliList
 
@@ -42,7 +48,9 @@ def cs_pow(l, power=1):
         Examples
         --------
 
-        >>> BivariateBicycleCodeBuilder.cs_pow(3, 2) # (C_3)^2
+        >>> cs_pow(3, 2)
+        (C_3)^2
+
         """
 
         return np.roll(np.eye(l, dtype=np.uint8), shift=power, axis=1)
@@ -66,7 +74,7 @@ class BBCodeVector:
         a: Tuple[int, int],
         b: Tuple[int, int],
     ) -> None:
-        """Initializes a bivariate bicycle code builder
+        """Initializes a bivariate bicycle code on a grid
 
         Args:
             l: dimension of first space of generators x and y,
@@ -77,6 +85,7 @@ class BBCodeVector:
         Examples:
             Example 1 (Gros code):
             >>> code = BBCodeVector(l=6, m=12, a=(3,2), b=(-1,3))
+            [[144,12,12]] bivariate bicycle code
         """
 
         self.l = l
@@ -92,10 +101,220 @@ class BBCodeVector:
         self._x_stabilizers = arr_to_indices(self.hx)
         self._z_stabilizers = arr_to_indices(self.hz)
 
-        self._create_logicals()
+        self.symplectic_stabilizers = np.vstack([np.hstack([self.hx, np.zeros((self.n//2, self.n))]),
+                                                 np.hstack([np.zeros((self.n//2, self.n)), self.hz])])
+
+        self._logical_x = None
+        self._logical_z = None
+
+        self._k = None
+        self._d = None
 
         self.create_tanner_graph()
 
+    def __str__(self) -> str:
+        """Formatted string."""
+        #return f"(l={self.l},m={self.m}) bivariate bicycle code"
+        return f"[[{self.n}, {self.k}, ≤{self.d}]] bivariate bicyle code"
+
+    def __repr__(self) -> str:
+        """String representation."""
+        val = str(self)
+        val += f"\nx_stabilizers = {self.x_stabilizers}"
+        val += f"\nz_stabilizers = {self.z_stabilizers}"
+        val += f"\nlogical_x = {self.logical_x}"
+        val += f"\nlogical_z = {self.logical_z}"
+        return val
+    
+    def __eq__(self, other: "BBCodeVector") -> bool:
+        return np.array_equal(self.hx, other.hx) and np.array_equal(self.hz, other.hz)
+
+    @property
+    def x_stabilizers(self) -> PauliList:
+        return self._x_stabilizers
+    
+    @property
+    def z_stabilizers(self) -> List[List[int]]:
+        return self._z_stabilizers
+    
+    @property
+    def x_gauges(self) -> PauliList:
+        return self.x_stabilizers
+    
+    @property
+    def z_gauges(self) -> PauliList:
+        return self.z_stabilizers
+    
+    @property
+    def logical_z(self) -> List[List[int]]:
+        if self._logical_z is None:
+            self._create_logicals()
+        return BBCode.arr_to_indices(self._logical_z.matrix[:, self.n:])
+    
+    @property
+    def logical_x(self) -> List[List[int]]:
+        if self._logical_x is None:
+            self._create_logicals()
+        return BBCode.arr_to_indices(self._logical_x.matrix[:, :self.n])
+    
+    @property
+    def k(self):
+        if self._k is None:
+            self._k = self.n - 2*rank(self.hx)
+        return self._k
+
+    @property
+    def d(self):
+        """ a simple upper bound for the code distance based on the current logical operators """
+        if self._d is None:
+            self._d = min(np.min([len(logx) for logx in self.logical_x]), np.min([len(logz) for logz in self.logical_z]))
+        return self._d
+    
+    def get_foliated_tanner_x(self, T, boundary_start=False, boundary_end=False):
+        m, n = self.hx.shape
+
+        shape = (T*m, (T+1)*m + T*n)
+
+        foliated = np.zeros(shape, dtype=np.bool_)
+
+        for i in range(T):
+            foliated[i*m:i*m+m, i*(m+n): i*(m+n) + m] = np.eye(m)
+            foliated[i*m:i*m+m, i*(m+n) + m: i*(m+n) + m+n] = self.hx
+            foliated[i*m:i*m+m, i*(m+n) + m+n: i*(m+n) + 2*m+n] = np.eye(m)
+
+        if not boundary_start:
+            foliated = foliated[:,m:]
+
+        if not boundary_end:
+            foliated = foliated[:,:-m]
+
+        return foliated
+    
+    def get_foliated_tanner_z(self, T, boundary_start=False, boundary_end=False):
+        m, n = self.hz.shape
+
+        shape = (T*m, (T+1)*m + T*n)
+
+        foliated = np.zeros(shape, dtype=np.bool_)
+
+        for i in range(T):
+            foliated[i*m:i*m+m, i*(m+n): i*(m+n) + m] = np.eye(m)
+            foliated[i*m:i*m+m, i*(m+n) + m: i*(m+n) + m+n] = self.hz
+            foliated[i*m:i*m+m, i*(m+n) + m+n: i*(m+n) + 2*m+n] = np.eye(m)
+
+        if not boundary_start:
+            foliated = foliated[:,m:]
+
+        if not boundary_end:
+            foliated = foliated[:,:-m]
+
+        return foliated
+    
+    def get_foliated_tanner(self, T, basis, boundary_start=False, boundary_end=False):
+        if basis=='x':
+            return self.get_foliated_tanner_x(T, boundary_start=boundary_start, boundary_end=boundary_end)
+        else:
+            return self.get_foliated_tanner_z(T, boundary_start=boundary_start, boundary_end=boundary_end)
+
+    def get_syndrome(self, physical_error: np.ndarray, base: str='z') -> np.ndarray:
+        if base == 'z':
+            return self.hz @ physical_error % 2
+        elif base == 'x':
+            return self.hx @ physical_error % 2
+        else:
+            raise ValueError(f'"base" must be one of {{"x", "y"}}, not {base}.')
+        
+    def get_logical_error(self, physical_error: np.ndarray, base: str='z') -> np.ndarray:
+        if self._logical_x is None:
+            self._create_logicals()
+        if base == 'z':
+            return self._logical_z.matrix[:, self.n:] @ physical_error % 2
+        elif base == 'x':
+            return self._logical_x.matrix[:, :self.n] @ physical_error % 2
+        else:
+            raise ValueError(f'"base" must be one of {{"x", "y"}}, not {base}.')
+    
+    def plot_code(self, faults=None, clusters=None, title=None, show=True, figsize = (12,8)):
+        """ Assumes z checks, can be customized later """
+        fig, ax = plt.subplots(figsize = figsize)        
+
+        x, y = self._idx2coord(np.arange(self.s))
+        
+        ax.scatter(x, y, color='blue', marker='o', label='L-Datas')
+        ax.scatter(x+0.5, y, color='green', marker='s', label='Z-Checks')
+        #ax.scatter(x, y+0.5, color='red', marker='s', label='X-Checks')
+        ax.scatter(x+0.5, y+0.5, color='orange', marker='o', label='R-Datas')
+        ax.set_aspect('equal')
+        if title is not None:
+            ax.set_title(title)
+        ax.set_xlabel('x (l)')
+        ax.set_ylabel('y (m)')
+        ax.set_xticks(np.arange(0,self.l))
+        ax.set_yticks(np.arange(0,self.m))
+
+        # Store the current limits after plotting the important data
+        x_limits = ax.get_xlim()
+        y_limits = ax.get_ylim()
+
+        # add errors
+        if faults is not None:
+            x_faults, y_faults = self._fault_idx2coord(faults)
+            ax.scatter(x_faults, y_faults, color='darkred', marker="$\u26A1$", s=324, label='actual_error')
+
+        cluster_colors = ['lightblue', 'lightpink', 'lightgreen', 'palegoldenrod', 'thistle', 'rosybrown', 'navajowhite', 'lightgray', 'mistyrose']
+
+        # add clusters
+        if clusters is not None:
+            for i, cluster in enumerate(clusters):
+                checks, datas = cluster
+                # assume z checks
+                #check nodes
+                for xi, yi in zip(*self._check_index2coord(checks, check_type='z')):
+                    circle = Circle((xi, yi), 0.3, color=cluster_colors[i % len(cluster_colors)], label='Scaled Circle', zorder=-1)
+                    ax.add_patch(circle)
+                # fault nodes
+                for xi, yi in zip(*self._fault_idx2coord(datas)):
+                    circle = Circle((xi, yi), 0.3, color=cluster_colors[i % len(cluster_colors)], label='Scaled Circle', zorder=-1)
+                    ax.add_patch(circle)
+
+        # Reapply the original limits
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig=fig)
+        return fig 
+
+    def plot_interactive_decoding(self, cluster_history: pd.DataFrame, actual_error, decoded_error, figsize=(12,8)):
+        step_count = cluster_history['step'].max() + 1
+        plots = []
+        for step_index in range(cluster_history['step'].max() + 1):
+            plots.append(
+                self.plot_code(
+                    faults=actual_error,
+                    clusters=cluster_history[cluster_history['step']==step_index]['cluster_nodes'].values,
+                    title=f'Growth step {step_index} and actual error',
+                    show=False,
+                    figsize=figsize))
+        plots.append(
+            self.plot_code(
+                faults=decoded_error,
+                clusters=cluster_history[cluster_history['step']==cluster_history['step'].max()]['cluster_nodes'].values,
+                title=f'Final clusters and decoded error',
+                show=False,
+                figsize=figsize)) 
+
+        output = widgets.Output()
+
+        def show_plot(step_index):
+            output.clear_output(wait=True)
+            with output:
+                display(plots[step_index])
+                
+        step_slider = widgets.IntSlider(min=0, max=step_count, step=1, value=0, description='Step:')
+        widget_ui = widgets.interactive(show_plot, step_index=step_slider)
+        display(widget_ui, output)
 
     def _create_check_matrices(self):
         A1 = np.eye(self.s, dtype=np.uint8)
@@ -173,9 +392,7 @@ class BBCodeVector:
         #     self.hz[i, vec_from_up + self.s] = 1
 
     def _create_logicals(self):
-        full_sym = np.vstack([np.hstack([self.hx, np.zeros((self.n//2, self.n))]),
-                                np.hstack([np.zeros((self.n//2, self.n)), self.hz])])
-        center_, x_new, z_new = normalizer(full_sym.astype(np.bool_))
+        center_, x_new, z_new = normalizer(self.symplectic_stabilizers.astype(np.bool_))
 
         self._logical_z = PauliList(z_new)
         self._logical_x = PauliList(x_new)
@@ -212,54 +429,6 @@ class BBCodeVector:
     
     def _coord_sub(self, coord, v):
         return (coord[0] - v[0]) % self.l, (coord[1] - v[1]) % self.m
-    
-    @property
-    def x_stabilizers(self) -> PauliList:
-        return self._x_stabilizers
-    
-    @property
-    def z_stabilizers(self) -> PauliList:
-        return self._z_stabilizers
-    
-    @property
-    def x_gauges(self) -> PauliList:
-        return self.x_stabilizers
-    
-    @property
-    def z_gauges(self) -> PauliList:
-        return self.z_stabilizers
-    
-    @property
-    def logical_z(self) -> List[List[int]]:
-        return BBCode.arr_to_indices(self._logical_z.matrix[:, self.n:])
-    
-    @property
-    def logical_x(self) -> List[List[int]]:
-        return BBCode.arr_to_indices(self._logical_x.matrix[:, :self.n])
-    
-    def get_syndrome(self, physical_error: np.ndarray, base: str='z') -> np.ndarray:
-        if base == 'z':
-            return self.hz @ physical_error % 2
-        elif base == 'x':
-            return self.hx @ physical_error % 2
-        else:
-            raise ValueError(f'"base" must be one of {{"x", "y"}}, not {base}.')
-        
-    def get_logical_error(self, physical_error: np.ndarray, base: str='z') -> np.ndarray:
-        if base == 'z':
-            return self._logical_z.matrix[:, self.n:] @ physical_error % 2
-        elif base == 'x':
-            return self._logical_x.matrix[:, :self.n] @ physical_error % 2
-        else:
-            raise ValueError(f'"base" must be one of {{"x", "y"}}, not {base}.')
-    
-    @property
-    def k(self):
-        raise NotImplementedError()
-
-    @property
-    def d(self):
-        raise NotImplementedError()
     
     class CodeConverter:
         def __init__(self, code_a: "BBCodeVector", code_b: "BBCodeVector", graph_matcher: nx.isomorphism.GraphMatcher) -> None:
@@ -325,22 +494,6 @@ class BBCodeVector:
     def tanner_graph_Z(self):
         nodes = self.tanner_graph.filter_nodes(lambda node: node['subtype'] != 'X')
         return self.tanner_graph.subgraph(nodes)
-
-    def __str__(self) -> str:
-        """Formatted string."""
-        return f"(l={self.l},m={self.m}) bivariate bicycle code"
-        #return f"[[{self.n}, {self.k}, {self.d}]] heavy-hexagon compass code"
-
-    def __repr__(self) -> str:
-        """String representation."""
-        val = str(self)
-        val += f"\nx_gauges = {self.x_gauges}"
-        val += f"\nz_gauges = {self.z_gauges}"
-        val += f"\nx_stabilizers = {self.x_stabilizers}"
-        val += f"\nz_stabilizers = {self.z_stabilizers}"
-        val += f"\nlogical_x = {self.logical_x}"
-        val += f"\nlogical_z = {self.logical_z}"
-        return val
     
     def create_tanner_graph(self):
         """
@@ -414,7 +567,8 @@ class BBCode:
         p1: Optional[Sequence[int]] = None,
         p2: Optional[Sequence[int]] = None
     ) -> None:
-        """Initializes a bivariate bicycle code builder
+        """ 
+        Initializes a bivariate bicycle code
 
         If p1 is not specified, then A has to be specified manually by set_A.
         If p2 is not specified, then B has to be specified manually by set_B.

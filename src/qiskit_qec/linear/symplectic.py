@@ -159,7 +159,7 @@ def _symplectic_product_vv(vec1: np.ndarray, vec2: np.ndarray, n: int) -> int:
     assert vec1.dtype != bool
     r = 0
     for i in range(n):
-        r += vec1[i] * vec2[n + i] + vec1[n + i] * vec2[i]
+        r ^= vec1[i] * vec2[n + i] + vec1[n + i] * vec2[i]
     return r % 2
 
 
