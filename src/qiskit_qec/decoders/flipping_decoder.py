@@ -1,59 +1,633 @@
 import numpy as np
+import heapq
 from ldpc import bposd_decoder, bp_decoder
 
-class GeneralFlippingDecoder():
-    def base_cost(self, marked_checks: np.ndarray[bool]):
-        return 1
 
-    def cost(self, marked_checks: np.ndarray[bool], max_cost, max_function_calls=np.inf, estimate=None):
-        function_calls = 1
-
-        cost_gauge = self.base_cost(marked_checks)
-        if estimate is not None:
-            cost_gauge = estimate
-        if cost_gauge == 0 or cost_gauge > max_cost:
-            return cost_gauge, [], function_calls
-        
-        if cost_gauge == 1:
-            faults_to_check = np.nonzero(self.fault_graph[marked_checks].all(axis=0) & np.logical_not(self.fault_graph[~marked_checks].any(axis=0)))[0]
-            if len(faults_to_check)  >= 1:
-                return cost_gauge, [faults_to_check[0]], function_calls
-            
-            cost_gauge += 1
-
-        while cost_gauge <= max_cost:
-            # calculate faults to check by how they would reduce
-            faults_to_check = np.nonzero(self.fault_graph[marked_checks].any(axis=0))[0] # any touching fault
-            # sort them based on something
-            sorter = self.fault_graph[marked_checks].sum(axis=0) - np.logical_not(self.fault_graph[marked_checks].sum(axis=0)).astype(np.int8)
-            sorter = sorter[faults_to_check]
-
-            faults_to_check = faults_to_check[np.argsort(sorter)[::-1]]
-
-            for fault in faults_to_check:
-                marked_checks_prime = marked_checks ^ (self.fault_graph[:, fault] == 1)
-
-                # need to check here
-                if max_function_calls - function_calls <= 0:
-                    return cost_gauge, [], function_calls
-                
-                if cost_gauge == estimate:
-                    cost, path, new_function_calls = self.cost(marked_checks_prime, max_cost = cost_gauge-1, max_function_calls=max_function_calls - function_calls, estimate=estimate-1)
-                else:
-                    cost, path, new_function_calls = self.cost(marked_checks_prime, max_cost = cost_gauge-1, max_function_calls=max_function_calls - function_calls)
-                function_calls += new_function_calls
-
-                if cost == cost_gauge-1:
-                    return cost_gauge, [fault] + path, function_calls
-            
-            # if at this point we haven't returned that means the actual cost is higher
-            # so we increase our estimate of the cost (by 2, as parity is fixed)
-            cost_gauge += 1
-            
-        return cost_gauge, [], function_calls
-
-    def __init__(self, fault_graph: np.ndarray):
+class MinimumWeightNoBPDecisionTreeDecoder():
+    def __init__(self, fault_graph: np.ndarray, idx2color: np.ndarray) -> None:
         self.fault_graph = fault_graph
+        self.idx2color = idx2color
+
+        # initialize adjacency matrices
+        self.check_to_fault = dict()
+        for check_index in range(self.fault_graph.shape[0]):
+            fault_indices = frozenset(np.where(self.fault_graph[check_index])[0])
+            self.check_to_fault[check_index] = fault_indices
+
+        self.fault_to_check = dict()
+        for fault_index in range(self.fault_graph.shape[1]):
+            check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
+            self.fault_to_check[fault_index] = check_indices
+
+    def get_descendants(self, c, F, s):
+        """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
+        # choose check index next to syndrome with lowest degree still available
+        idx = np.argmin([len(self.check_to_fault[check_index] - F) for check_index in s])
+        check_index = list(s)[idx]
+
+        # look at those faults, they are branches down to descendants
+        down_branches = list(self.check_to_fault[check_index] - F)
+
+        relevant_costs = np.zeros(len(down_branches))
+        
+            
+        return down_branches, relevant_costs
+
+    def decode(self, syndrome: np.ndarray[bool], max_depth = np.inf, max_iterations = np.inf):
+        """ Fast, non-provable version of decision tree decoding. Relies on BP and does not take structure into account.
+        Decimation (once implemented in ldpc fork) done around lowest degree check node.
+        Parameters:
+            early_exit: whether we return a solution direclty in BP converged. default False (but will be True at some point).
+            max_depth: limit depth of decision tree, i.e. nodes of that depth will not have any descendants.
+            max_iterations: maximum nodes that will be explored, if exceeded will raise Exception.
+            bp_buffer_method: whether and how to include the buffer of BP LLRs """
+        
+        # initialization
+        s = frozenset(np.where(syndrome)[0]) # sparse version of syndrome
+        if len(s) == 0:
+            return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
+        tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
+        unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
+        wlb = self.weight_lower_bound(s, frozenset())
+        heapq.heappush(unexplored_leaves, ((wlb, 0), frozenset(), s)) # add empty set / root with cost 0 to it.
+
+        # decoding
+        while len(unexplored_leaves) > 0:
+
+            if len(tree_nodes)-len(unexplored_leaves) >= max_iterations:
+                return frozenset(), 'fail', np.zeros(self.fault_graph.shape[1],dtype=bool), tree_nodes, unexplored_leaves
+
+            c, F, s = heapq.heappop(unexplored_leaves) # get next unexplored leaf
+
+            # now get children... runs BP
+            down_branches, relevant_costs = self.get_descendants(c,F,s)
+            
+            # else add children
+            for f, dc in zip(down_branches, relevant_costs):
+                F_prime = F | frozenset([f])
+                if F_prime in tree_nodes: # if node already discovered, ignore
+                    continue
+                c_prime = c[1] + dc # c[1] is the cost from BP
+                s_prime = s ^ self.fault_to_check[f]
+                if len(s_prime) == 0: # if we have a solution we return it right away (before this is actually explored)
+                    decoded_error = np.zeros(self.fault_graph.shape[1],dtype=bool)
+                    decoded_error[list(F_prime)] = True
+                    return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
+                
+                # calculate weight lower bound
+                wlb = self.weight_lower_bound(s_prime, F_prime)
+
+                # otherwise add the new leaf to data structures
+                tree_nodes.add(F_prime)
+                heapq.heappush(unexplored_leaves, ((wlb, c_prime), F_prime, s_prime))
+
+    def weight_lower_bound(self, s, F):
+        bound_w = int(np.ceil((len(s)-self.count_f3(s,F))/2))
+        bound_c = np.max(self.syndrome2color_count(s))
+
+        bound = max(bound_c, bound_w)
+        bound_with_history = bound + len(F)
+
+        return bound_with_history
+    
+    def count_f3(self, s, F):
+        neigbour_faults = set()
+        for check_index in s:
+            neigbour_faults |= self.check_to_fault[check_index]
+        neigbour_faults -= F
+
+        f3s = 0
+        for fault_index in neigbour_faults:
+            if len(self.fault_to_check[fault_index] & s) == 3:
+                f3s += 1
+        return f3s
+    
+    def syndrome2color_count(self, syndrome):
+        color, count = np.unique(self.idx2color[list(syndrome)], return_counts=True)
+        return count[np.argsort(color)]
+
+class BreadthFirstDecisionTreeDecoder():
+    def __init__(self, fault_graph: np.ndarray) -> None:
+        self.fault_graph = fault_graph
+
+        # initialize adjacency matrices
+        self.check_to_fault = dict()
+        for check_index in range(self.fault_graph.shape[0]):
+            fault_indices = frozenset(np.where(self.fault_graph[check_index])[0])
+            self.check_to_fault[check_index] = fault_indices
+
+        self.fault_to_check = dict()
+        for fault_index in range(self.fault_graph.shape[1]):
+            check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
+            self.fault_to_check[fault_index] = check_indices
+
+    def get_descendants(self, c, F, s):
+        """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
+        # choose check index next to syndrome with lowest degree still available
+        idx = np.argmin([len(self.check_to_fault[check_index] - F) for check_index in s])
+        check_index = list(s)[idx]
+
+        # look at those faults, they are branches down to descendants
+        down_branches = list(self.check_to_fault[check_index] - F)
+        
+        relevant_costs = np.ones(len(down_branches))
+            
+        return down_branches, relevant_costs
+    
+    def decode(self, syndrome: np.ndarray[bool], max_depth = np.inf, max_iterations = np.inf):
+        """ Fast, non-provable version of decision tree decoding. Relies on BP and does not take structure into account.
+        Decimation (once implemented in ldpc fork) done around lowest degree check node.
+        Parameters:
+            early_exit: whether we return a solution direclty in BP converged. default False (but will be True at some point).
+            max_depth: limit depth of decision tree, i.e. nodes of that depth will not have any descendants.
+            max_iterations: maximum nodes that will be explored, if exceeded will raise Exception."""
+        
+        # initialization
+        s = frozenset(np.where(syndrome)[0]) # sparse version of syndrome
+        if len(s) == 0:
+            return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
+        tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
+        unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
+        heapq.heappush(unexplored_leaves, (0, frozenset(), s)) # add empty set / root with cost 0 to it.
+
+        # decoding
+        while len(unexplored_leaves) > 0:
+
+            if len(tree_nodes)-len(unexplored_leaves) >= max_iterations:
+                return frozenset(), 'fail', np.zeros(self.fault_graph.shape[1],dtype=bool), tree_nodes, unexplored_leaves
+
+            c, F, s = heapq.heappop(unexplored_leaves) # get next unexplored leaf
+
+            # now get children... runs BP
+            down_branches, relevant_costs = self.get_descendants(c,F,s)
+            
+            # else add children
+            for f, dc in zip(down_branches, relevant_costs):
+                F_prime = F | frozenset([f])
+                if F_prime in tree_nodes: # if node already discovered, ignore
+                    continue
+                c_prime = c + dc
+                s_prime = s ^ self.fault_to_check[f]
+                if len(s_prime) == 0: # if we have a solution we return it right away (before this is actually explored)
+                    decoded_error = np.zeros(self.fault_graph.shape[1],dtype=bool)
+                    decoded_error[list(F_prime)] = True
+                    return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
+
+                # otherwise add the new leaf to data structures
+                tree_nodes.add(F_prime)
+                heapq.heappush(unexplored_leaves, (c_prime, F_prime, s_prime))
+
+class MinimumWeightDecisionTreeDecoder():
+    def __init__(self, fault_graph: np.ndarray, idx2color: np.ndarray, max_iter=1024, buffer_length=1, priors=None, init_max_iter=None, learning_rate=1) -> None:
+        self.fault_graph = fault_graph
+        self.idx2color = idx2color
+
+        if priors is None: priors = [None]
+
+        self.max_iter = max_iter
+        if init_max_iter is None:
+            init_max_iter = max_iter
+        self.init_max_iter = init_max_iter
+
+        bpd=bp_decoder(
+            self.fault_graph,#the parity check matrix
+            error_rate=0.01,# dummy error rate
+            channel_probs=priors, #assign error_rate to each qubit. This will override "error_rate" input variable
+            max_iter=max_iter, #the maximum number of iterations for BP)
+            bp_method="ms",
+            ms_scaling_factor=0, #min sum scaling factor. If set to zero the variable scaling factor method is used
+            buffer_length=buffer_length,
+            learning_rate=learning_rate,
+            )
+        self.bpd = bpd
+
+        # initialize adjacency matrices
+        self.check_to_fault = dict()
+        for check_index in range(self.fault_graph.shape[0]):
+            fault_indices = frozenset(np.where(self.fault_graph[check_index])[0])
+            self.check_to_fault[check_index] = fault_indices
+
+        self.fault_to_check = dict()
+        for fault_index in range(self.fault_graph.shape[1]):
+            check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
+            self.fault_to_check[fault_index] = check_indices
+
+    def get_descendants(self, c, F, s, bp_buffer_method):
+        """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
+        # choose check index next to syndrome with lowest degree still available
+        idx = np.argmin([len(self.check_to_fault[check_index] - F) for check_index in s])
+        check_index = list(s)[idx]
+
+        # look at those faults, they are branches down to descendants
+        down_branches = list(self.check_to_fault[check_index] - F)
+        
+        # create full syndrome for BP
+        syndrome = np.zeros(self.fault_graph.shape[0],dtype=bool)
+        syndrome[list(s)] = True
+
+        # run BP
+        #self.bpd.decode(syndrome)
+        if len(F) == 0:
+            self.bpd.max_iter = self.init_max_iter
+        else:
+            self.bpd.max_iter = self.max_iter
+            
+        self.bpd.decode_decimated(syndrome, F)
+
+        if bp_buffer_method is None or self.bpd.converge:
+            llrs = self.bpd.log_prob_ratios[down_branches]
+            relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            #relevant_costs = np.piecewise(llrs, 
+            #                            [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+            #                            [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+        else:
+            if bp_buffer_method == 'max':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].max(axis=0)
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif bp_buffer_method == 'min':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].min(axis=0)
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif bp_buffer_method == 'mean':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                #relevant_costs = np.piecewise(llrs, 
+                #                              [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+                #                              [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif (type(bp_buffer_method) == int or type(bp_buffer_method) == float) and bp_buffer_method > 0:
+                zcr = np.count_nonzero(np.diff(np.sign(self.bpd.log_prob_ratios_buffer[:,down_branches]), axis=0), axis=0)/len(self.bpd.log_prob_ratios_buffer)
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                cost_unweighted = llrs + np.log(1+np.exp(-llrs))
+                t = zcr**(1/bp_buffer_method)
+                relevant_costs = -np.log(0.5)*t + cost_unweighted*(1-t)
+            else:
+                raise TypeError(f'Invalid bp_buffer_method {bp_buffer_method}. Must be one of Union[None, "max", "min", "mean"] or a numeric value')
+            
+        return down_branches, relevant_costs
+
+    def decode(self, syndrome: np.ndarray[bool], early_exit = False, max_depth = np.inf, max_iterations = np.inf, bp_buffer_method=None):
+        """ Fast, non-provable version of decision tree decoding. Relies on BP and does not take structure into account.
+        Decimation (once implemented in ldpc fork) done around lowest degree check node.
+        Parameters:
+            early_exit: whether we return a solution direclty in BP converged. default False (but will be True at some point).
+            max_depth: limit depth of decision tree, i.e. nodes of that depth will not have any descendants.
+            max_iterations: maximum nodes that will be explored, if exceeded will raise Exception.
+            bp_buffer_method: whether and how to include the buffer of BP LLRs """
+        
+        # initialization
+        s = frozenset(np.where(syndrome)[0]) # sparse version of syndrome
+        if len(s) == 0:
+            return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
+        tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
+        unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
+        wlb = self.weight_lower_bound(s, frozenset())
+        heapq.heappush(unexplored_leaves, ((wlb, 0), frozenset(), s)) # add empty set / root with cost 0 to it.
+
+        # decoding
+        while len(unexplored_leaves) > 0:
+
+            if len(tree_nodes)-len(unexplored_leaves) >= max_iterations:
+                return frozenset(), 'fail', np.zeros(self.fault_graph.shape[1],dtype=bool), tree_nodes, unexplored_leaves
+
+            c, F, s = heapq.heappop(unexplored_leaves) # get next unexplored leaf
+
+            # now get children... runs BP
+            down_branches, relevant_costs = self.get_descendants(c,F,s, bp_buffer_method)
+            
+            # if BP converged and we allow early exit return solution
+            if early_exit and self.bpd.converge and self.bpd.bp_decoding.sum() + len(F) == c[0]:
+                decoded_error = self.bpd.bp_decoding # decoding from bp
+                for f in F:
+                    decoded_error[f] = 1
+                return frozenset(np.where(decoded_error)[0]), 'early_exit', decoded_error, tree_nodes, unexplored_leaves
+            
+            # else add children
+            for f, dc in zip(down_branches, relevant_costs):
+                F_prime = F | frozenset([f])
+                if F_prime in tree_nodes: # if node already discovered, ignore
+                    continue
+                c_prime = c[1] + dc # c[1] is the cost from BP
+                s_prime = s ^ self.fault_to_check[f]
+                if len(s_prime) == 0: # if we have a solution we return it right away (before this is actually explored)
+                    decoded_error = np.zeros(self.fault_graph.shape[1],dtype=bool)
+                    decoded_error[list(F_prime)] = True
+                    return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
+                
+                # calculate weight lower bound
+                wlb = self.weight_lower_bound(s_prime, F_prime)
+
+                # otherwise add the new leaf to data structures
+                tree_nodes.add(F_prime)
+                heapq.heappush(unexplored_leaves, ((wlb, c_prime), F_prime, s_prime))
+
+    def weight_lower_bound(self, s, F):
+        bound_w = int(np.ceil((len(s)-self.count_f3(s,F))/2))
+        bound_c = np.max(self.syndrome2color_count(s))
+
+        bound = max(bound_c, bound_w)
+        bound_with_history = bound + len(F)
+
+        return bound_with_history
+    
+    def count_f3(self, s, F):
+        neigbour_faults = set()
+        for check_index in s:
+            neigbour_faults |= self.check_to_fault[check_index]
+        neigbour_faults -= F
+
+        f3s = 0
+        for fault_index in neigbour_faults:
+            if len(self.fault_to_check[fault_index] & s) == 3:
+                f3s += 1
+        return f3s
+    
+    def syndrome2color_count(self, syndrome):
+        color, count = np.unique(self.idx2color[list(syndrome)], return_counts=True)
+        return count[np.argsort(color)]
+    
+
+class GeneralFlippingDecoder():
+
+    def get_descendants(self, c, F, s, bp_buffer_method):
+        """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
+        # choose check index next to syndrome with lowest degree still available
+        idx = np.argmin([len(self.check_to_fault[check_index] - F) for check_index in s])
+        check_index = list(s)[idx]
+
+        # look at those faults, they are branches down to descendants
+        down_branches = list(self.check_to_fault[check_index] - F)
+        
+        # create full syndrome for BP
+        syndrome = np.zeros(self.fault_graph.shape[0],dtype=bool)
+        syndrome[list(s)] = True
+
+        # run BP
+        #self.bpd.decode(syndrome)
+        if len(F) == 0:
+            self.bpd.max_iter = self.init_max_iter
+        else:
+            self.bpd.max_iter = self.max_iter
+            
+        self.bpd.decode_decimated(syndrome, F)
+
+        if bp_buffer_method is None or self.bpd.converge:
+            llrs = self.bpd.log_prob_ratios[down_branches]
+            relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            #relevant_costs = np.piecewise(llrs, 
+            #                            [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+            #                            [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+        else:
+            if bp_buffer_method == 'max':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].max(axis=0)
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif bp_buffer_method == 'min':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].min(axis=0)
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif bp_buffer_method == 'mean':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                #relevant_costs = np.piecewise(llrs, 
+                #                              [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+                #                              [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            elif (type(bp_buffer_method) == int or type(bp_buffer_method) == float) and bp_buffer_method > 0:
+                zcr = np.count_nonzero(np.diff(np.sign(self.bpd.log_prob_ratios_buffer[:,down_branches]), axis=0), axis=0)/len(self.bpd.log_prob_ratios_buffer)
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                cost_unweighted = llrs + np.log(1+np.exp(-llrs))
+                t = zcr**(1/bp_buffer_method)
+                relevant_costs = -np.log(0.5)*t + cost_unweighted*(1-t)
+            else:
+                raise TypeError(f'Invalid bp_buffer_method {bp_buffer_method}. Must be one of Union[None, "max", "min", "mean"] or a numeric value')
+            
+        return down_branches, relevant_costs
+
+
+    def decode(self, syndrome: np.ndarray[bool], early_exit = False, max_depth = np.inf, max_iterations = np.inf, bp_buffer_method=None):
+        """ Fast, non-provable version of decision tree decoding. Relies on BP and does not take structure into account.
+        Decimation (once implemented in ldpc fork) done around lowest degree check node.
+        Parameters:
+            early_exit: whether we return a solution direclty in BP converged. default False (but will be True at some point).
+            max_depth: limit depth of decision tree, i.e. nodes of that depth will not have any descendants.
+            max_iterations: maximum nodes that will be explored, if exceeded will raise Exception.
+            bp_buffer_method: whether and how to include the buffer of BP LLRs """
+        
+        # initialization
+        s = frozenset(np.where(syndrome)[0]) # sparse version of syndrome
+        if len(s) == 0:
+            return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
+        tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
+        unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
+        heapq.heappush(unexplored_leaves, (0, frozenset(), s)) # add empty set / root with cost 0 to it.
+
+        # decoding
+        while len(unexplored_leaves) > 0:
+
+            if len(tree_nodes)-len(unexplored_leaves) >= max_iterations:
+                return frozenset(), 'fail', np.zeros(self.fault_graph.shape[1],dtype=bool), tree_nodes, unexplored_leaves
+
+            c, F, s = heapq.heappop(unexplored_leaves) # get next unexplored leaf
+
+            # now get children... runs BP
+            down_branches, relevant_costs = self.get_descendants(c,F,s, bp_buffer_method)
+            
+            # if BP converged and we allow early exit return solution
+            if early_exit and self.bpd.converge:
+                decoded_error = self.bpd.bp_decoding # decoding from bp
+                for f in F:
+                    decoded_error[f] = 1
+                return frozenset(np.where(decoded_error)[0]), 'early_exit', decoded_error, tree_nodes, unexplored_leaves
+            
+            # else add children
+            for f, dc in zip(down_branches, relevant_costs):
+                F_prime = F | frozenset([f])
+                if F_prime in tree_nodes: # if node already discovered, ignore
+                    continue
+                c_prime = c + dc
+                s_prime = s ^ self.fault_to_check[f]
+                if len(s_prime) == 0: # if we have a solution we return it right away (before this is actually explored)
+                    decoded_error = np.zeros(self.fault_graph.shape[1],dtype=bool)
+                    decoded_error[list(F_prime)] = True
+                    return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
+                # otherwise add the new leaf to data structures
+                tree_nodes.add(F_prime)
+                heapq.heappush(unexplored_leaves, (c_prime, F_prime, s_prime))
+                   
+    def __init__(self, fault_graph: np.ndarray, max_iter=1024, buffer_length=1, priors=None, init_max_iter=None, learning_rate=1):
+        self.fault_graph = fault_graph
+
+        if priors is None: priors = [None]
+
+        self.max_iter = max_iter
+        if init_max_iter is None:
+            init_max_iter = max_iter
+        self.init_max_iter = init_max_iter
+
+        bpd=bp_decoder(
+            self.fault_graph,#the parity check matrix
+            error_rate=0.01,# dummy error rate
+            channel_probs=priors, #assign error_rate to each qubit. This will override "error_rate" input variable
+            max_iter=max_iter, #the maximum number of iterations for BP)
+            bp_method="ms",
+            ms_scaling_factor=0, #min sum scaling factor. If set to zero the variable scaling factor method is used
+            buffer_length=buffer_length,
+            learning_rate=learning_rate,
+            )
+        self.bpd = bpd
+
+        # initialize adjacency matrices
+        self.check_to_fault = dict()
+        for check_index in range(self.fault_graph.shape[0]):
+            fault_indices = frozenset(np.where(self.fault_graph[check_index])[0])
+            self.check_to_fault[check_index] = fault_indices
+
+        self.fault_to_check = dict()
+        for fault_index in range(self.fault_graph.shape[1]):
+            check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
+            self.fault_to_check[fault_index] = check_indices
+
+class GeneralOracleFlippingDecoder():
+
+    def incremental_cost(self, llrs):
+        alpha = 6
+        beta = 1
+        c1 = (alpha+beta) / np.pi
+        c2 = 0.5
+        c3 = 2
+        c4 = (alpha-beta) / 2
+        return c1*np.arctan(c2*(llrs - c3)) + c4
+
+    def get_descendants(self, c, F, s, bp_buffer_method):
+        """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
+        # choose check index next to syndrome with lowest degree still available
+        idx = np.argmin([len(self.check_to_fault[check_index] - F) for check_index in s])
+        check_index = list(s)[idx]
+
+        # look at those faults, they are branches down to descendants
+        down_branches = list(self.check_to_fault[check_index] - F)
+        
+        # create full syndrome for BP
+        syndrome = np.zeros(self.fault_graph.shape[0],dtype=bool)
+        syndrome[list(s)] = True
+
+        # run BP
+        #self.bpd.decode(syndrome)
+        if len(F) == 0:
+            self.bpd.max_iter = self.init_max_iter
+        else:
+            self.bpd.max_iter = self.max_iter
+            
+        self.bpd.decode_decimated(syndrome, F)
+
+        if bp_buffer_method is None or self.bpd.converge:
+            llrs = self.bpd.log_prob_ratios[down_branches]
+            relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            #relevant_costs = np.piecewise(llrs, 
+            #                            [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+            #                            [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+        else:
+            if bp_buffer_method == 'max':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].max(axis=0)
+                relevant_costs = self.incremental_cost(llrs)
+            elif bp_buffer_method == 'min':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].min(axis=0)
+                relevant_costs = self.incremental_cost(llrs)
+            elif bp_buffer_method == 'mean':
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                #relevant_costs = np.piecewise(llrs, 
+                #                              [llrs <= -32, (llrs > 32) & (llrs < 32), llrs >= 32],
+                #                              [lambda llr: 0, lambda llr: llr + np.log(1+np.exp(-llr)), lambda llr: llr])
+                relevant_costs = self.incremental_cost(llrs)
+            elif (type(bp_buffer_method) == int or type(bp_buffer_method) == float) and bp_buffer_method > 0:
+                zcr = np.count_nonzero(np.diff(np.sign(self.bpd.log_prob_ratios_buffer[:,down_branches]), axis=0), axis=0)/len(self.bpd.log_prob_ratios_buffer)
+                llrs = self.bpd.log_prob_ratios_buffer[:,down_branches].mean(axis=0)
+                cost_unweighted = self.incremental_cost(llrs)
+                t = zcr**(1/bp_buffer_method)
+                relevant_costs = -np.log(0.5)*t + cost_unweighted*(1-t)
+            else:
+                raise TypeError(f'Invalid bp_buffer_method {bp_buffer_method}. Must be one of Union[None, "max", "min", "mean"] or a numeric value')
+            
+        return down_branches, relevant_costs
+
+    def decode(self, syndrome: np.ndarray[bool], early_exit = False, max_depth = np.inf, max_iterations = np.inf, bp_buffer_method=None):
+        """ Fast, non-provable version of decision tree decoding. Relies on BP and does not take structure into account.
+        Decimation (once implemented in ldpc fork) done around lowest degree check node.
+        Parameters:
+            early_exit: whether we return a solution direclty in BP converged. default False (but will be True at some point).
+            max_depth: limit depth of decision tree, i.e. nodes of that depth will not have any descendants.
+            max_iterations: maximum nodes that will be explored, if exceeded will raise Exception.
+            bp_buffer_method: whether and how to include the buffer of BP LLRs """
+        
+        # initialization
+        s = frozenset(np.where(syndrome)[0]) # sparse version of syndrome
+        if len(s) == 0:
+            return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
+        tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
+        unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
+        heapq.heappush(unexplored_leaves, (0, frozenset(), s)) # add empty set / root with cost 0 to it.
+
+        # decoding
+        while len(unexplored_leaves) > 0:
+
+            if len(tree_nodes)-len(unexplored_leaves) >= max_iterations:
+                return frozenset(), 'fail', np.zeros(self.fault_graph.shape[1],dtype=bool), tree_nodes, unexplored_leaves
+
+            c, F, s = heapq.heappop(unexplored_leaves) # get next unexplored leaf
+
+            # now get children... runs BP
+            down_branches, relevant_costs = self.get_descendants(c,F,s, bp_buffer_method)
+            
+            # if BP converged and we allow early exit return solution
+            if early_exit and self.bpd.converge:
+                decoded_error = self.bpd.bp_decoding # decoding from bp
+                for f in F:
+                    decoded_error[f] = 1
+                return frozenset(np.where(decoded_error)[0]), 'early_exit', decoded_error, tree_nodes, unexplored_leaves
+            
+            # else add children
+            for f, dc in zip(down_branches, relevant_costs):
+                F_prime = F | frozenset([f])
+                if F_prime in tree_nodes: # if node already discovered, ignore
+                    continue
+                c_prime = c + dc
+                s_prime = s ^ self.fault_to_check[f]
+                if len(s_prime) == 0: # if we have a solution we return it right away (before this is actually explored)
+                    decoded_error = np.zeros(self.fault_graph.shape[1],dtype=bool)
+                    decoded_error[list(F_prime)] = True
+                    return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
+                # otherwise add the new leaf to data structures
+                tree_nodes.add(F_prime)
+                heapq.heappush(unexplored_leaves, (c_prime, F_prime, s_prime))
+                   
+    def __init__(self, fault_graph: np.ndarray, max_iter=1024, buffer_length=1, priors=None, init_max_iter=None, learning_rate=1):
+        self.fault_graph = fault_graph
+
+        if priors is None: priors = [None]
+
+        self.max_iter = max_iter
+        if init_max_iter is None:
+            init_max_iter = max_iter
+        self.init_max_iter = init_max_iter
+
+        bpd=bp_decoder(
+            self.fault_graph,#the parity check matrix
+            error_rate=0.01,# dummy error rate
+            channel_probs=priors, #assign error_rate to each qubit. This will override "error_rate" input variable
+            max_iter=max_iter, #the maximum number of iterations for BP)
+            bp_method="ms",
+            ms_scaling_factor=0, #min sum scaling factor. If set to zero the variable scaling factor method is used
+            buffer_length=buffer_length,
+            learning_rate=learning_rate,
+            )
+        self.bpd = bpd
+
+        # initialize adjacency matrices
+        self.check_to_fault = dict()
+        for check_index in range(self.fault_graph.shape[0]):
+            fault_indices = frozenset(np.where(self.fault_graph[check_index])[0])
+            self.check_to_fault[check_index] = fault_indices
+
+        self.fault_to_check = dict()
+        for fault_index in range(self.fault_graph.shape[1]):
+            check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
+            self.fault_to_check[fault_index] = check_indices
 
 class FlippingDecoder():
     def idx2color(self, idx):
@@ -82,7 +656,291 @@ class FlippingDecoder():
                 return True, faults_to_check[0]
         return False, None
         
-    def weight_iterative_with_bp(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf):
+    def get_next_edge_idx(self, node_idx, nodes, children_lookup, syndrome, weight_lb, use_bp=True):
+        """ assume use_bp always true, will implement the false case later
+         Returns index of edge in children lookup """
+        # if children have already been calculated, use that
+        if node_idx in children_lookup:
+            edge_list = children_lookup[node_idx]
+            # find first edge that points to non-exisiting child node
+            for edge_idx, (edge_label, child_idx) in enumerate(edge_list):
+                if child_idx is None:
+                    return edge_idx
+            # else if no such edge exists anymore return None
+            return None
+
+        # else if the true lower bound of this syndrome is already higher than the desired one, we stop evaluating it
+        if self.base_cost(syndrome) > weight_lb:
+            children_lookup[node_idx] = [] # this node will not have any children
+            return None # so we return None
+        
+        # else we calculate all possible candidate faults, sort them, and store them
+        # based on the syndrome "weight" and the weight lower bound restrict candidates
+        if syndrome.sum() <= weight_lb:
+            if weight_lb == 4:
+                candidate_faults_mask = self.fault_graph[syndrome][0] == 1
+            else:
+                candidate_faults_mask = self.fault_graph[syndrome].any(axis=0)
+        elif syndrome.sum() <= 2*weight_lb:
+            candidate_faults_mask = self.fault_graph[syndrome].sum(axis=0) >= 2
+        else: #syndrome.sum() <= 3*weight_lb
+            candidate_faults_mask = self.fault_graph[syndrome].sum(axis=0) >= 3
+        
+        # remove candidates that are already in fault sequence (do not take double click paths)
+        for fault in nodes[node_idx]:
+            candidate_faults_mask[fault] = 0
+
+        # if we do memoization, we should filter out some more candidates here
+        # for debugging purposes (being able to not do memoization, or do memoization but see subproblem graph)
+        # we do not do this here, but in the main algorithm, only linear overhead in num iterations
+
+        minimum_needed_errors = max(1, syndrome.sum() - 2*weight_lb)
+        if candidate_faults_mask.sum() < minimum_needed_errors:
+            children_lookup[node_idx] = [] # this node will not have any children
+            return None # so we return None
+        
+        # else we sort them according to BP
+        self.bpd.decode(syndrome)
+        # calculate actual candidate fault indices and sort them according to their likelihood
+        candidate_fault_indices = np.where(candidate_faults_mask)[0][np.argsort(self.bpd.log_prob_ratios[candidate_faults_mask])]
+        
+        # if the minimum_needed_errors is e.g. 3, in the worse case there are 3 errors in the end of the list
+        # while before there are none. But that means we can safely discard the last 2 faults
+        if minimum_needed_errors > 1:
+            candidate_fault_indices = candidate_fault_indices[:-minimum_needed_errors+1]
+
+        # now that we got all candidate faults we have to check in the right order
+        # store this information for later
+        children_lookup[node_idx] = [(edge_label, None) for edge_label in candidate_fault_indices]
+        return 0 # and we return 0 to imply that we start with the first edge in the list        
+
+    def weight_priority_queue(self, syndrome: np.ndarray[bool], max_weight, max_iterations = np.inf, memoize=True, increase=2, initial_lb=0, bp_buffer_method=None):
+        # fuck the base case...
+        syndrome = syndrome.astype(bool) # just in case I forget...
+
+        weight_lb = self.base_cost(syndrome)
+        weight_lb = max(weight_lb, initial_lb)
+
+        num_iterations = 0
+        debug_object = []
+
+        if weight_lb == 0:
+            return 0, (), num_iterations, debug_object
+        
+        def update_nodes(current_node_idx, nodes, syndrome, weight_lb):
+            current_node_label, _, current_logperr, _ = nodes[current_node_idx]
+            weight_lb -= len(current_node_label)
+
+            # if the true lower bound of this syndrome is already higher than the desired one, no children
+            if self.base_cost(syndrome) > weight_lb:
+                return
+            
+            # else we calculate all possible candidate faults, sort them, and store them
+            # based on the syndrome "weight" and the weight lower bound restrict candidates
+            if syndrome.sum() <= weight_lb:
+                if weight_lb == 4:
+                    candidate_faults_mask = self.fault_graph[syndrome][0] == 1
+                else:
+                    candidate_faults_mask = self.fault_graph[syndrome].any(axis=0)
+                    # should not be like this, but let's leave it for now
+            elif syndrome.sum() <= 2*weight_lb:
+                candidate_faults_mask = self.fault_graph[syndrome].sum(axis=0) >= 2
+            else: #syndrome.sum() <= 3*weight_lb
+                candidate_faults_mask = self.fault_graph[syndrome].sum(axis=0) >= 3
+            
+            # remove candidates that are already in fault sequence (do not take double click paths)
+            for fault in current_node_label:
+                candidate_faults_mask[fault] = 0
+
+            # calculate candidate fault indices
+            candidate_fault_indices = np.where(candidate_faults_mask)[0]
+
+            # remove candidates that lead to already visited node (memoization)
+            for idx, (node_label, _, logperr, visited) in enumerate(nodes):
+                for fault_idx in candidate_fault_indices:
+                    if tuple(np.sort(current_node_label + (fault_idx,))) == node_label:
+                        # if not visited:
+                            # update logperr
+
+                        candidate_faults_mask[fault_idx] = 0
+
+            minimum_needed_errors = max(1, syndrome.sum() - 2*weight_lb)
+            if candidate_faults_mask.sum() < minimum_needed_errors:
+                return # this node will not have any children
+            
+            # else we sort them according to BP
+            self.bpd.decode(syndrome)
+            if bp_buffer_method is None or self.bpd.converge:
+                llrs = self.bpd.log_prob_ratios[candidate_faults_mask]
+                relevant_costs = llrs + np.log(1+np.exp(-llrs))
+            else:
+                if bp_buffer_method == 'max':
+                    llrs = self.bpd.log_prob_ratios_buffer[:,candidate_faults_mask].max(axis=0)
+                    relevant_costs = llrs + np.log(1+np.exp(-llrs))
+                elif bp_buffer_method == 'min':
+                    llrs = self.bpd.log_prob_ratios_buffer[:,candidate_faults_mask].min(axis=0)
+                    relevant_costs = llrs + np.log(1+np.exp(-llrs))
+                elif bp_buffer_method == 'mean':
+                    llrs = self.bpd.log_prob_ratios_buffer[:,candidate_faults_mask].mean(axis=0)
+                    relevant_costs = llrs + np.log(1+np.exp(-llrs))
+                elif (type(bp_buffer_method) == int or type(bp_buffer_method) == float) and bp_buffer_method > 0:
+                    zcr = np.count_nonzero(np.diff(np.sign(self.bpd.log_prob_ratios_buffer[:,candidate_faults_mask]), axis=0), axis=0)/len(self.bpd.log_prob_ratios_buffer)
+                    llrs = self.bpd.log_prob_ratios_buffer[:,candidate_faults_mask].mean(axis=0)
+                    cost_unweighted = llrs + np.log(1+np.exp(-llrs))
+                    t = zcr**(1/bp_buffer_method)
+                    relevant_costs = -np.log(0.5)*t + cost_unweighted*(1-t)
+                else:
+                    raise TypeError(f'Invalid bp_buffer_method {bp_buffer_method}. Must be one of Union[None, "max", "min", "mean"] or a numeric value')
+            # calculate actual candidate fault indices and sort them according to their likelihood
+            #sorter = np.argsort(self.bpd.log_prob_ratios[candidate_faults_mask])
+            candidate_fault_cost = np.sort(relevant_costs)
+            candidate_fault_indices = np.where(candidate_faults_mask)[0][np.argsort(relevant_costs)]
+            
+            # if the minimum_needed_errors is e.g. 3, in the worse case there are 3 errors in the end of the list
+            # while before there are none. But that means we can safely discard the last 2 faults
+            if minimum_needed_errors > 1:
+                candidate_fault_indices = candidate_fault_indices[:-minimum_needed_errors+1]
+
+            # now that we got all candidate faults we have to check in the right order
+            # store this information for later
+            for edge_cost, candidate_fault in zip(candidate_fault_cost, candidate_fault_indices):
+                node_label = tuple(np.sort(current_node_label + (candidate_fault,)))
+                logperr = current_logperr + edge_cost
+                nodes.append((node_label, current_node_idx, logperr, False))
+
+        def get_next_unvisited_idx(nodes):
+            best_idx = None
+            best_logperr = np.inf
+            for idx, (node_label, parent_idx, logperr, visited) in enumerate(nodes):
+                if not visited and logperr < best_logperr:
+                    best_logperr = logperr
+                    best_idx = idx
+            return best_idx
+
+
+        original_syndrome = syndrome.copy()
+
+        while weight_lb <= max_weight:
+            nodes = [((), None, 0, False)] # list of nodes, a node is a tuple (node_label, parent_idx, logperr, visited)
+            #parent_lookup = {0: (None, None)} # node_idx: (edge_label, parent_idx)
+            #children_lookup = {} # node_idx: [(edge_label, child_idx), (edge_label, child_idx), ..., (edge_label, None)]
+
+            tree_object = {
+                'weight_bound': weight_lb,
+                'num_iterations': 0,
+                'nodes': nodes,
+            }
+
+            debug_object.append(tree_object)
+
+            while True: # The backtracking dynamic programming part tries to find a solution with weight <= weight_lb
+                tree_object['num_iterations'] += 1 # of the current subroutine
+                num_iterations += 1 # total
+                if num_iterations >= max_iterations:
+                    raise ValueError(f"MaxIterations {max_iterations} exceeded (Will be a custom exception)")
+                
+                current_node_idx = get_next_unvisited_idx(nodes)
+
+                if current_node_idx is None:
+                    # no more nodes to visit
+                    break
+                
+                # else we go visit this node
+                node_label, parent_idx, logperr, visited = nodes[current_node_idx]
+                nodes[current_node_idx] = (node_label, parent_idx, logperr, True) # update that we visited this node
+                syndrome = original_syndrome ^ (self.fault_graph[:, node_label].sum(axis=1) % 2 == 1)
+                if syndrome.sum() == 0: #syndrome.any()
+                    return len(node_label), node_label, num_iterations, debug_object
+                # if self.base_cost(syndrome) > weight_lb - len(node_label): # in this case do not look at kids
+                #    continue
+                update_nodes(current_node_idx, nodes, syndrome, weight_lb)
+
+                #this should be everything, no????                    
+
+            # if this failed, increase the weight lower bound
+            weight_lb += increase
+
+        # if unsuccessful, return
+        return weight_lb, None, num_iterations, debug_object
+
+    def weight_reworked(self, syndrome: np.ndarray[bool], max_weight, max_iterations = np.inf, memoize=True, increase=2, initial_lb=0):
+        # fuck the base case...
+        syndrome = syndrome.astype(bool) # just in case I forget...
+
+        weight_lb = self.base_cost(syndrome)
+        weight_lb = max(weight_lb, initial_lb)
+
+        num_iterations = 0
+        debug_object = []
+
+        if weight_lb == 0:
+            return 0, (), num_iterations, debug_object
+
+        while weight_lb <= max_weight:
+            nodes = [()] # [(), (f1), (f1,f2), (f1,f3), (f4), ...]
+            parent_lookup = {0: (None, None)} # node_idx: (edge_label, parent_idx)
+            children_lookup = {} # node_idx: [(edge_label, child_idx), (edge_label, child_idx), ..., (edge_label, None)]
+
+            tree_object = {
+                'weight_bound': weight_lb,
+                'num_iterations': 0,
+                'nodes': nodes,
+                'parent_lookup': parent_lookup,
+                'children_lookup': children_lookup
+            }
+
+            debug_object.append(tree_object)
+            
+            current_node_idx = 0
+
+            while True: # The backtracking dynamic programming part tries to find a solution with weight <= weight_lb
+                tree_object['num_iterations'] += 1 # of the current subroutine
+                num_iterations += 1 # total
+                if num_iterations >= max_iterations:
+                    raise ValueError(f"MaxIterations {max_iterations} exceeded (Will be a custom exception)")
+                
+                next_edge_idx = self.get_next_edge_idx(current_node_idx, nodes, children_lookup, syndrome, weight_lb)
+                if next_edge_idx is not None:
+                    next_fault = children_lookup[current_node_idx][next_edge_idx][0]
+                    new_node_idx = len(nodes)
+                    new_fault_set = nodes[current_node_idx] + (next_fault,)
+                    if memoize:
+                        new_fault_set = tuple(np.sort(new_fault_set))
+                        children_lookup[current_node_idx][next_edge_idx] = (next_fault, new_node_idx)
+                        if new_fault_set in nodes:
+                            continue
+                    else:
+                        children_lookup[current_node_idx][next_edge_idx] = (next_fault, new_node_idx)
+                    
+                    # update parent
+                    parent_lookup[new_node_idx] = (next_fault, current_node_idx) # update parent dictionary
+                    nodes.append(new_fault_set) # update nodes list
+                    current_node_idx = new_node_idx # go to the new node
+                    syndrome = syndrome ^ (self.fault_graph[:, next_fault] == 1) # by altering the syndrome accordingly
+
+                    # if syndrome is trivial, we found a solution
+                    if syndrome.sum() == 0:
+                        return len(new_fault_set), new_fault_set, num_iterations, debug_object
+                    
+                    # else start loop again, as we went down a node, decrease weight lower bound
+                    weight_lb -= 1
+
+                else: # this node has no more children to explore, go up (backtracking step)
+                    fault, parent_idx = parent_lookup[current_node_idx]
+                    if parent_idx is None: # we are at root, we stop trying this weight lower bound and increase it
+                        break
+                    
+                    current_node_idx = parent_idx # go up to the parent node
+                    syndrome = syndrome ^ (self.fault_graph[:, fault] == 1) # by undoing the flip on the syndrome
+                    weight_lb += 1 # as we went up, increase the weight lower bound
+
+            # if this failed, increase the weight lower bound
+            weight_lb += increase
+
+        # if unsuccessful, return
+        return weight_lb, None, num_iterations, debug_object
+
+    def weight_iterative_with_bp(self, syndrome: np.ndarray, max_weight, max_iterations = np.inf, memoize=True):
         """
         Iterative minimum weight calculations.
         Returns weight_estimate (weight lower bound), minimum_weight_error, number_of_calls
@@ -107,11 +965,8 @@ class FlippingDecoder():
         num_iterations = 0
 
         while weight_estimate <= max_weight:
-            num_iterations += 1
-            if num_iterations >= max_iterations:
-                raise ValueError(f"MaxIterations {max_iterations} exceeded (Will be a custom exception)")
-
-            # assume weight = weight_estimate, dynamic programming using that assumption
+                        # assume weight = weight_estimate, dynamic programming using that assumption
+            num_iterations_i = 0
             nodes = [()]
             parent_lookup = {0: None}
             children_lookup = {0: []}
@@ -119,7 +974,12 @@ class FlippingDecoder():
             current_node = 0
 
             while True:
-                if weight_estimate <= 1:
+                num_iterations_i +=1
+                num_iterations += 1
+                if num_iterations >= max_iterations:
+                    raise ValueError(f"MaxIterations {max_iterations} exceeded (Will be a custom exception)")
+
+                if weight_estimate <= 1: # comes from the fact that the base case has been checked. go up the tree
                     faults_to_check_mask = np.array([0])
                 elif syndrome.sum() <= weight_estimate:
                     if weight_estimate == 4: # small optimization, only look around 1 particular check
@@ -140,20 +1000,31 @@ class FlippingDecoder():
                     #faults_to_check = np.nonzero(graph[syndrome].sum(axis=0) >= 3)[0]
                     #faults_to_check = faults_to_check[len(children_lookup[current_node]):]
 
+                for f in nodes[current_node]:
+                    if len(faults_to_check_mask) > 1: #otherwise it is empty...
+                        faults_to_check_mask[f] = 0
+
                 num_remaining_candidates = faults_to_check_mask.sum() - len(children_lookup[current_node]) #total - the ones checked already
-                if num_remaining_candidates < syndrome.sum() - 2*weight_estimate: # feasability filter
+                if num_remaining_candidates < max(1, syndrome.sum() - 2*weight_estimate): # feasability filter
                     faults_to_check_mask = np.array([0])
 
                 if faults_to_check_mask.sum() > 0: # not good...
                     #use bpd to find likelihoods of faults being in Fhat
-                    self.bpd.decode(syndrome)
+                    self.bpd.decode(syndrome) # technically belong into the get next fault function
                     # calculate actual candidate fault indices and sort them according to their likelihood
                     faults_to_check = np.where(faults_to_check_mask)[0][np.argsort(self.bpd.log_prob_ratios[faults_to_check_mask])]
                     # the fault we check is the next one we haven't checked
                     fault = faults_to_check[len(children_lookup[current_node])]
                     new_node_idx = len(nodes)
                     new_fault_set = nodes[current_node] + (fault,)
-                    children_lookup[current_node].append(new_node_idx)
+                    if memoize:
+                        new_fault_set = tuple(np.sort(new_fault_set))
+                        children_lookup[current_node].append(new_node_idx) # add to children lookup in any case, because otherwise endless loop..
+                        if new_fault_set in nodes:
+                            continue
+                    else:
+                        children_lookup[current_node].append(new_node_idx)
+                    #children_lookup[current_node].append(new_node_idx)
                     parent_lookup[new_node_idx] = current_node
                     nodes.append(new_fault_set)
                     children_lookup[new_node_idx] = []
@@ -175,7 +1046,12 @@ class FlippingDecoder():
                         parent_idx = parent_lookup[current_node]
                         if parent_idx is None:
                             break
-                        fault = nodes[current_node][-1]
+                        #fault = nodes[current_node][-1]
+                        if memoize:
+                            # then fault is set difference
+                            fault = [f for f in nodes[current_node] if f not in nodes[parent_idx]][0]
+                        else:
+                            fault = nodes[current_node][-1]
                         syndrome = syndrome ^ (graph[:, fault] == 1)
                         current_node = parent_idx
                         weight_estimate += 1
@@ -185,7 +1061,12 @@ class FlippingDecoder():
                     parent_idx = parent_lookup[current_node]
                     if parent_idx is None:
                         break
-                    fault = nodes[current_node][-1]
+                    #fault = nodes[current_node][-1]
+                    if memoize:
+                        # then fault is set difference
+                        fault = [f for f in nodes[current_node] if f not in nodes[parent_idx]][0]
+                    else:
+                        fault = nodes[current_node][-1]
                     syndrome = syndrome ^ (graph[:, fault] == 1)
                     current_node = parent_idx
                     weight_estimate += 1
@@ -593,7 +1474,7 @@ class FlippingDecoder():
                 full_error[idx] = not full_error[idx]
             return full_error, function_calls
 
-    def __init__(self, fault_graph: np.ndarray, max_iter=1024) -> None:
+    def __init__(self, fault_graph: np.ndarray, max_iter=1024, buffer_length=1) -> None:
         self.fault_graph = fault_graph
 
         bpd=bp_decoder(
@@ -603,6 +1484,7 @@ class FlippingDecoder():
             max_iter=max_iter, #the maximum number of iterations for BP)
             bp_method="ms",
             ms_scaling_factor=0, #min sum scaling factor. If set to zero the variable scaling factor method is used
+            buffer_length=buffer_length,
             )
         self.bpd = bpd
 
@@ -720,6 +1602,127 @@ class FlippingDecoder():
         nx_kwargs['node_color'] = nx_kwargs.get('node_color', "lightblue")
         nx_kwargs['font_size'] = nx_kwargs.get('font_size', 10)
         nx.draw(graph, pos, **nx_kwargs)
+        plt.show()
+
+    def plot_subproblem_graph_from_iterative_tree_object(self, tree_object, fig_size = (12,4), full_search_tree = True, **nx_kwargs):
+        import networkx as nx
+        import matplotlib.pyplot as plt
+
+        nodes = tree_object['nodes']
+        parent_lookup = tree_object['parent_lookup']
+
+        graph = nx.DiGraph()
+
+        if full_search_tree:
+            for node in nodes:
+                graph.add_node(node)
+
+            edge_labels = {}
+            for node_idx, (edge_label, parent_idx) in parent_lookup.items():
+                if parent_idx is None:
+                    continue
+                graph.add_edge(nodes[parent_idx], nodes[node_idx])
+                edge_labels[(nodes[parent_idx], nodes[node_idx])] = edge_label
+
+        else:
+            for node in nodes:
+                graph.add_node(tuple(np.sort(node)))
+
+            edge_labels = {}
+            for node_idx, parent_idx in parent_lookup.items():
+                if parent_idx is None:
+                    continue
+                graph.add_edge(tuple(np.sort(nodes[parent_idx])), tuple(np.sort(nodes[node_idx])))
+                graph.add_edge(nodes[parent_idx], nodes[node_idx])
+
+        # Define a function to get the level of each node
+        def get_levels(graph):
+            levels = {}
+            for node, data in graph.nodes(data=True):
+                levels[node] = len(node) #data['level']
+            return levels
+
+        # Get the levels of nodes
+        levels = get_levels(graph)
+
+        # Assign positions for nodes (y-coordinate fixed by level, x-coordinate free)
+        pos = {}
+        level_nodes = {}
+        for node, level in levels.items():
+            if level not in level_nodes:
+                level_nodes[level] = []
+            level_nodes[level].append(node)
+
+        for level in level_nodes:
+            num_nodes = len(level_nodes[level])
+            for i, node in enumerate(level_nodes[level]):
+                pos[node] = (i*8- 4*len(level_nodes[level]), -level)  # x is free (i), y is fixed (-level to draw downward)
+        print(graph.number_of_nodes())
+        plt.figure(figsize=fig_size)
+        nx_kwargs['with_labels'] = nx_kwargs.get('with_labels', False)
+        nx_kwargs['arrows'] = nx_kwargs.get('arrows', True)
+        nx_kwargs['node_size'] = nx_kwargs.get('node_size', 50)
+        nx_kwargs['node_color'] = nx_kwargs.get('node_color', "lightblue")
+        nx_kwargs['font_size'] = nx_kwargs.get('font_size', 10)
+        nx.draw(graph, pos, **nx_kwargs)
+        nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels)
+        plt.show()
+
+    def plot_subproblem_graph_from_priority_queue(self, tree_object, fig_size = (12,4), full_search_tree = True, **nx_kwargs):
+        import networkx as nx
+        import matplotlib.pyplot as plt
+
+        nodes = tree_object['nodes']
+
+        graph = nx.DiGraph()
+
+        edge_labels = {}
+        for node_label, parent_idx, _, visited in nodes:
+            if visited:
+                graph.add_node(node_label)
+                if parent_idx is not None:
+                    try:
+                        edge_label = list(set(node_label)-set(nodes[parent_idx][0]))[0]
+                    except IndexError:
+                        print(nodes[parent_idx][0])
+                        print(node_label)
+                        print(set(nodes[parent_idx][0]) - set(node_label))
+                        print(list(set(nodes[parent_idx][0]) - set(node_label)))
+                    graph.add_edge(nodes[parent_idx][0], node_label)
+                    edge_labels[(nodes[parent_idx][0], node_label)] = edge_label
+
+        # Define a function to get the level of each node
+        def get_levels(graph):
+            levels = {}
+            for node, data in graph.nodes(data=True):
+                levels[node] = len(node) #data['level']
+            return levels
+
+        # Get the levels of nodes
+        levels = get_levels(graph)
+
+        # Assign positions for nodes (y-coordinate fixed by level, x-coordinate free)
+        pos = {}
+        level_nodes = {}
+        for node, level in levels.items():
+            if level not in level_nodes:
+                level_nodes[level] = []
+            level_nodes[level].append(node)
+
+        for level in level_nodes:
+            num_nodes = len(level_nodes[level])
+            for i, node in enumerate(level_nodes[level]):
+                pos[node] = (i*8- 4*len(level_nodes[level]), -level)  # x is free (i), y is fixed (-level to draw downward)
+        print(graph.number_of_nodes())
+
+        plt.figure(figsize=fig_size)
+        nx_kwargs['with_labels'] = nx_kwargs.get('with_labels', False)
+        nx_kwargs['arrows'] = nx_kwargs.get('arrows', True)
+        nx_kwargs['node_size'] = nx_kwargs.get('node_size', 50)
+        nx_kwargs['node_color'] = nx_kwargs.get('node_color', "lightblue")
+        nx_kwargs['font_size'] = nx_kwargs.get('font_size', 10)
+        nx.draw(graph, pos, **nx_kwargs)
+        nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels)
         plt.show()
 
     def plot_subproblem_graph_from_debug_history(self, history, fig_size = (12,4), full_search_tree = True, **nx_kwargs):
