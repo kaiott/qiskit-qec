@@ -211,6 +211,8 @@ class MinimumWeightDecisionTreeDecoder():
         for fault_index in range(self.fault_graph.shape[1]):
             check_indices = frozenset(np.where(self.fault_graph[:,fault_index])[0])
             self.fault_to_check[fault_index] = check_indices
+        
+        self.c = max([len(checks) for checks in self.fault_to_check.values()]) #max number of checks per fault
 
     def get_descendants(self, c, F, s, bp_buffer_method):
         """ Implements the growing step of a leaf efficiently (instead of iterating over faults) """
@@ -279,7 +281,12 @@ class MinimumWeightDecisionTreeDecoder():
             return frozenset(), 'initial_exit', np.zeros(self.fault_graph.shape[1],dtype=bool), set(), []
         tree_nodes = set([frozenset()]) # initialize identified nodes with root (empty fault set)
         unexplored_leaves = [] # min-heap / priority queue for unexplored but identified leaves
-        wlb = self.weight_lower_bound(s, frozenset())
+        # wlb = self.weight_lower_bound(s, frozenset())
+        if len(self.idx2color)!=0:
+            wlb = self.weight_lower_bound(s, frozenset())
+        else:
+            wlb = self.weight_lower_bound_2(s, frozenset())
+
         heapq.heappush(unexplored_leaves, ((wlb, 0), frozenset(), s)) # add empty set / root with cost 0 to it.
 
         # decoding
@@ -313,11 +320,36 @@ class MinimumWeightDecisionTreeDecoder():
                     return F_prime, 'late_exit', decoded_error, tree_nodes, unexplored_leaves
                 
                 # calculate weight lower bound
-                wlb = self.weight_lower_bound(s_prime, F_prime)
+                if len(self.idx2color)!=0:
+                    wlb = self.weight_lower_bound(s_prime, F_prime)
+                else:
+                    wlb = self.weight_lower_bound_2(s_prime, F_prime)
 
                 # otherwise add the new leaf to data structures
                 tree_nodes.add(F_prime)
                 heapq.heappush(unexplored_leaves, ((wlb, c_prime), F_prime, s_prime))
+
+    def weight_lower_bound_2(self, s, F):
+        """returns the more refined genral bound h2"""
+        a = np.zeros(self.c)
+        for check_index in s:
+            sensitivity = 1
+            neigbour_faults = self.check_to_fault[check_index]
+            for fault in neigbour_faults:
+                sensitivity = max(sensitivity, len(self.fault_to_check[fault] & s))
+            a[sensitivity-1] += 1
+        q=0 #q_c
+        h2=0
+        l=self.c
+        while l>0:
+            h2 += np.floor((q+a[l-1])/l)
+            q = (q+a[l-1])%l
+            l-=1
+        bound = h2
+        bound_with_history = bound + len(F)
+
+        return bound_with_history
+    
 
     def weight_lower_bound(self, s, F):
         bound_w = int(np.ceil((len(s)-self.count_f3(s,F))/2))
@@ -344,7 +376,6 @@ class MinimumWeightDecisionTreeDecoder():
         color, count = np.unique(self.idx2color[list(syndrome)], return_counts=True)
         return count[np.argsort(color)]
     
-
 class GeneralFlippingDecoder():
 
     def get_descendants(self, c, F, s, bp_buffer_method):
